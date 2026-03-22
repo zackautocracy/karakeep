@@ -192,7 +192,7 @@ Karakeep uses [tesseract.js](https://github.com/naptha/tesseract.js) to extract 
 
 ## Webhook Configs
 
-You can use webhooks to trigger actions when bookmarks are created, changed or crawled.
+You can use webhooks to trigger actions when bookmarks are created, edited, crawled, deleted, AI tagged, or video processed.
 
 | Name                | Required | Default | Description                                       |
 | ------------------- | -------- | ------- | ------------------------------------------------- |
