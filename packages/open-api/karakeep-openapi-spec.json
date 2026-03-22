@@ -243,6 +243,15 @@
                     "type": "string",
                     "nullable": true
                   },
+                  "contentSource": {
+                    "type": "string",
+                    "nullable": true,
+                    "enum": [
+                      "crawled",
+                      "manual",
+                      "transcript"
+                    ]
+                  },
                   "crawledAt": {
                     "type": "string",
                     "nullable": true

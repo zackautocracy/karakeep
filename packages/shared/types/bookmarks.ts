@@ -52,6 +52,7 @@ export const zBookmarkedLinkSchema = z.object({
   favicon: z.string().nullish(),
   htmlContent: z.string().nullish(),
   contentAssetId: z.string().nullish(),
+  contentSource: z.enum(["crawled", "manual", "transcript"]).nullish(),
   crawledAt: z.date().nullish(),
   crawlStatus: z.enum(["success", "failure", "pending"]).nullish(),
   author: z.string().nullish(),
