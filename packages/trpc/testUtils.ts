@@ -98,6 +98,7 @@ export function defaultBeforeEach(seedDB = true) {
         triggerRuleEngineOnEvent: vi.fn(),
         triggerSearchReindex: vi.fn(),
         triggerWebhook: vi.fn(),
+        storeHtmlContent: vi.fn().mockResolvedValue({ result: "store_inline" }),
       };
     });
     Object.assign(context, await buildTestContext(seedDB));

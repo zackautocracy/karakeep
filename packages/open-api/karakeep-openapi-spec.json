@@ -1331,6 +1331,13 @@
                   "assetContent": {
                     "type": "string",
                     "nullable": true
+                  },
+                  "htmlContent": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "triggerInference": {
+                    "type": "boolean"
                   }
                 }
               }

@@ -40,3 +40,15 @@ Everything in Karakeep starts as a bookmark. Here’s how the different types wo
 - **Screenshots & archives**: fallback when the original page changes or disappear.
 - **Uploaded files**: keep PDFs, notes, or supporting assets right with the link.
 - Manage attachments from the bookmark detail view: upload, download, or detach as needed.
+
+## Video Transcripts
+
+- Save a YouTube or video link and Karakeep can pull the subtitles for you automatically.
+- Transcripts become the bookmark's readable content, so you can search and skim them just like any article.
+- Pick which subtitle languages you prefer in the [environment variables](../03-configuration/01-environment-variables.md) settings (`CRAWLER_EXTRACT_TRANSCRIPT`, `CRAWLER_TRANSCRIPT_LANGS`).
+
+## Manual Content Editing
+
+- Replace or set the readable content of any link bookmark through the API.
+- Useful when the crawler didn't grab the right text, or you want to paste your own cleaned-up version.
+- Your manual edits are protected: re-crawling won't overwrite content you've set yourself.

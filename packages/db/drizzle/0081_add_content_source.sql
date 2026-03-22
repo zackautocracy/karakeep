@@ -1,0 +1,1 @@
+ALTER TABLE `bookmarkLinks` ADD `contentSource` text DEFAULT 'crawled' NOT NULL;

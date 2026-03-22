@@ -242,6 +242,10 @@ export const zUpdateBookmarksRequestSchema = z.object({
 
   // Asset specific fields (optional)
   assetContent: z.string().nullish(),
+
+  // Link HTML content (optional) — for setting reader view content via API
+  htmlContent: z.string().nullish(),
+  triggerInference: z.boolean().optional(),
 });
 export type ZUpdateBookmarksRequest = z.infer<
   typeof zUpdateBookmarksRequestSchema
