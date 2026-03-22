@@ -469,6 +469,7 @@ export const bookmarksAppRouter = router({
         }
       }
 
+      let txCommitted = false;
       try {
         await ctx.db.transaction(async (tx) => {
           let somethingChanged = false;
@@ -632,6 +633,7 @@ export const bookmarksAppRouter = router({
               );
           }
         });
+        txCommitted = true;
 
         // Clean up old content asset after transaction
         if (htmlContentUpdate?.oldContentAssetId) {
@@ -689,8 +691,8 @@ export const bookmarksAppRouter = router({
 
         return updatedBookmark;
       } catch (e) {
-        // Clean up newly stored asset blob if the mutation failed
-        if (htmlContentUpdate?.contentAssetId) {
+        // Clean up newly stored asset blob only if the transaction didn't commit
+        if (!txCommitted && htmlContentUpdate?.contentAssetId) {
           await silentDeleteAsset(
             ctx.user.id,
             htmlContentUpdate.contentAssetId,
