@@ -20,7 +20,7 @@ export async function storeHtmlContent(
   htmlContent: string | undefined,
   userId: string,
 ): Promise<StoreHtmlResult> {
-  if (!htmlContent) {
+  if (htmlContent == null) {
     return { result: "not_stored" };
   }
 
