@@ -99,6 +99,7 @@ export function defaultBeforeEach(seedDB = true) {
           enqueue: vi.fn(),
         },
         triggerSearchReindex: vi.fn(),
+        storeHtmlContent: vi.fn().mockResolvedValue({ result: "store_inline" }),
       };
     });
     Object.assign(context, await buildTestContext(seedDB));

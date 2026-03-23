@@ -1,4 +1,5 @@
 import fs from "fs";
+import { readdir, readFile } from "fs/promises";
 import * as os from "os";
 import path from "path";
 import { execa } from "execa";
@@ -7,14 +8,20 @@ import { getProxyAgent, validateUrl } from "network";
 import { withWorkerTracing } from "workerTracing";
 
 import { db } from "@karakeep/db";
-import { AssetTypes } from "@karakeep/db/schema";
+import { assets, AssetTypes, bookmarkLinks } from "@karakeep/db/schema";
 import {
+  OpenAIQueue,
+  QueuePriority,
   QuotaService,
   StorageQuotaError,
+  storeHtmlContent,
+  triggerSearchReindex,
   VideoWorkerQueue,
   ZVideoRequest,
   zvideoRequestSchema,
 } from "@karakeep/shared-server";
+import { WebhooksService } from "@karakeep/trpc/models/webhooks.service";
+import { eq } from "drizzle-orm";
 import {
   ASSET_TYPES,
   newAssetId,
@@ -26,6 +33,7 @@ import logger from "@karakeep/shared/logger";
 import { DequeuedJob, getQueueClient } from "@karakeep/shared/queueing";
 
 import { getBookmarkDetails, updateAsset } from "../workerUtils";
+import { parseVttToHtml } from "./vttParser";
 
 const TMP_FOLDER = path.join(os.tmpdir(), "video_downloads");
 
@@ -89,6 +97,170 @@ function prepareYtDlpArguments(
   return ytDlpArguments;
 }
 
+async function extractTranscript(
+  url: string,
+  tmpDir: string,
+  jobId: string,
+  abortSignal?: AbortSignal,
+): Promise<string | null> {
+  if (!serverConfig.crawler.extractTranscript) {
+    return null;
+  }
+
+  const transcriptLangs = serverConfig.crawler.transcriptLangs;
+
+  try {
+    const proxy = getProxyAgent(url);
+    const args = [
+      "--write-subs",
+      "--write-auto-subs",
+      "--ignore-errors",
+      "--sub-lang",
+      transcriptLangs,
+      "--sub-format",
+      "vtt",
+      "--skip-download",
+      "--no-playlist",
+      "--output",
+      `${tmpDir}/%(id)s`,
+      url,
+    ];
+    if (proxy) {
+      args.push("--proxy", proxy.proxy.toString());
+    }
+
+    try {
+      await execa("yt-dlp", args, {
+        cancelSignal: abortSignal,
+      });
+    } catch {
+      // yt-dlp may exit non-zero when some (not all) subtitle languages
+      // fail to download (e.g. HTTP 429). We still check for downloaded files below.
+      abortSignal?.throwIfAborted();
+    }
+
+    const files = await readdir(tmpDir);
+    const vttFiles = files.filter((f) => f.endsWith(".vtt"));
+    if (vttFiles.length === 0) return null;
+
+    // Prefer VTT file matching configured language order
+    const langOrder = transcriptLangs.split(",").map((l) => l.trim());
+    let selectedVtt = vttFiles[0];
+    for (const lang of langOrder) {
+      const match = vttFiles.find((f) => f.includes(`.${lang}.`));
+      if (match) {
+        selectedVtt = match;
+        break;
+      }
+    }
+
+    const vttPath = path.join(tmpDir, selectedVtt);
+    const resolvedPath = await fs.promises.realpath(vttPath);
+    const resolvedDir = await fs.promises.realpath(tmpDir);
+    if (!resolvedPath.startsWith(resolvedDir + path.sep)) {
+      logger.warn(
+        `[VideoCrawler][${jobId}] VTT path traversal attempt detected: "${selectedVtt}"`,
+      );
+      return null;
+    }
+
+    const vttContent = await readFile(resolvedPath, "utf-8");
+    return parseVttToHtml(vttContent);
+  } catch {
+    abortSignal?.throwIfAborted();
+    logger.info(`[VideoCrawler][${jobId}] No subtitles available for "${url}"`);
+    return null;
+  }
+}
+
+async function storeTranscriptContent(
+  bookmarkId: string,
+  userId: string,
+  transcript: string,
+  jobId: string,
+  normalizedUrl: string,
+): Promise<void> {
+  const existingLink = await db.query.bookmarkLinks.findFirst({
+    where: eq(bookmarkLinks.id, bookmarkId),
+    columns: { contentSource: true, contentAssetId: true },
+  });
+
+  if (existingLink?.contentSource === "manual") {
+    logger.info(
+      `[VideoCrawler][${jobId}] Skipping transcript: contentSource is manual`,
+    );
+    return;
+  }
+
+  const oldContentAssetId = existingLink?.contentAssetId ?? undefined;
+  const storageResult = await storeHtmlContent(transcript, userId);
+
+  if (storageResult.result === "stored") {
+    await db.transaction(async (txn) => {
+      await updateAsset(
+        oldContentAssetId,
+        {
+          id: storageResult.assetId,
+          bookmarkId,
+          userId,
+          assetType: AssetTypes.LINK_HTML_CONTENT,
+          contentType: ASSET_TYPES.TEXT_HTML,
+          size: storageResult.size,
+          fileName: null,
+        },
+        txn,
+      );
+      await txn
+        .update(bookmarkLinks)
+        .set({
+          htmlContent: null,
+          contentAssetId: storageResult.assetId,
+          contentSource: "transcript",
+        })
+        .where(eq(bookmarkLinks.id, bookmarkId));
+    });
+    if (oldContentAssetId) {
+      await silentDeleteAsset(userId, oldContentAssetId);
+    }
+  } else if (storageResult.result === "store_inline") {
+    await db.transaction(async (txn) => {
+      if (oldContentAssetId) {
+        await txn.delete(assets).where(eq(assets.id, oldContentAssetId));
+      }
+      await txn
+        .update(bookmarkLinks)
+        .set({
+          htmlContent: transcript,
+          contentAssetId: null,
+          contentSource: "transcript",
+        })
+        .where(eq(bookmarkLinks.id, bookmarkId));
+    });
+    if (oldContentAssetId) {
+      await silentDeleteAsset(userId, oldContentAssetId);
+    }
+  } else {
+    // not_stored (quota exceeded or no content) — nothing to save
+    return;
+  }
+
+  await Promise.all([
+    OpenAIQueue.enqueue(
+      { bookmarkId, type: "summarize" },
+      { priority: QueuePriority.Default, groupId: userId },
+    ),
+    OpenAIQueue.enqueue(
+      { bookmarkId, type: "tag" },
+      { priority: QueuePriority.Default, groupId: userId },
+    ),
+    triggerSearchReindex(bookmarkId, { groupId: userId }),
+  ]);
+
+  logger.info(
+    `[VideoCrawler][${jobId}] Stored transcript for "${normalizedUrl}" and triggered AI inference`,
+  );
+}
+
 async function runWorker(job: DequeuedJob<ZVideoRequest>) {
   const jobId = job.id;
   const { bookmarkId } = job.data;
@@ -99,121 +271,164 @@ async function runWorker(job: DequeuedJob<ZVideoRequest>) {
     videoAssetId: oldVideoAssetId,
   } = await getBookmarkDetails(bookmarkId);
 
-  if (!serverConfig.crawler.downloadVideo) {
-    logger.info(
-      `[VideoCrawler][${jobId}] Skipping video download from "${url}", because it is disabled in the config.`,
-    );
-    return;
-  }
-
+  // URL validation — needed for BOTH video download AND transcript extraction (SSRF protection)
   const proxy = getProxyAgent(url);
   const validation = await validateUrl(url, !!proxy);
   if (!validation.ok) {
     logger.warn(
-      `[VideoCrawler][${jobId}] Skipping video download to disallowed URL "${url}": ${validation.reason}`,
+      `[VideoCrawler][${jobId}] Skipping video worker for disallowed URL "${url}": ${validation.reason}`,
     );
     return;
   }
   const normalizedUrl = validation.url.toString();
 
-  const videoAssetId = newAssetId();
-  let assetPath = `${TMP_FOLDER}/${videoAssetId}`;
-  await fs.promises.mkdir(TMP_FOLDER, { recursive: true });
+  // Video download (conditional on config)
+  if (serverConfig.crawler.downloadVideo) {
+    const videoAssetId = newAssetId();
+    let assetPath = `${TMP_FOLDER}/${videoAssetId}`;
+    await fs.promises.mkdir(TMP_FOLDER, { recursive: true });
 
-  const ytDlpArguments = prepareYtDlpArguments(
-    normalizedUrl,
-    proxy?.proxy.toString(),
-    assetPath,
-  );
-
-  try {
-    logger.info(
-      `[VideoCrawler][${jobId}] Attempting to download a file from "${normalizedUrl}" to "${assetPath}" using the following arguments: "${ytDlpArguments}"`,
+    const ytDlpArguments = prepareYtDlpArguments(
+      normalizedUrl,
+      proxy?.proxy.toString(),
+      assetPath,
     );
 
-    await execa("yt-dlp", ytDlpArguments, {
-      cancelSignal: job.abortSignal,
-    });
-    const downloadPath = await findAssetFile(videoAssetId);
-    if (!downloadPath) {
+    try {
       logger.info(
-        "[VideoCrawler][${jobId}] yt-dlp didn't download anything. Skipping ...",
+        `[VideoCrawler][${jobId}] Attempting to download a file from "${normalizedUrl}" to "${assetPath}"`,
       );
-      return;
+
+      await execa("yt-dlp", ytDlpArguments, {
+        cancelSignal: job.abortSignal,
+      });
+      const downloadPath = await findAssetFile(videoAssetId);
+      if (!downloadPath) {
+        logger.info(
+          `[VideoCrawler][${jobId}] yt-dlp didn't download anything. Skipping ...`,
+        );
+        // Don't return — continue to transcript extraction
+      } else {
+        assetPath = downloadPath;
+
+        logger.info(
+          `[VideoCrawler][${jobId}] Finished downloading a file from "${normalizedUrl}" to "${assetPath}"`,
+        );
+
+        // Get file size and check quota before saving
+        const stats = await fs.promises.stat(assetPath);
+        const fileSize = stats.size;
+
+        try {
+          const quotaApproved = await QuotaService.checkStorageQuota(
+            db,
+            userId,
+            fileSize,
+          );
+
+          await saveAssetFromFile({
+            userId,
+            assetId: videoAssetId,
+            assetPath,
+            metadata: { contentType: ASSET_TYPES.VIDEO_MP4 },
+            quotaApproved,
+          });
+
+          await db.transaction(async (txn) => {
+            await updateAsset(
+              oldVideoAssetId,
+              {
+                id: videoAssetId,
+                bookmarkId,
+                userId,
+                assetType: AssetTypes.LINK_VIDEO,
+                contentType: ASSET_TYPES.VIDEO_MP4,
+                size: fileSize,
+              },
+              txn,
+            );
+          });
+          await silentDeleteAsset(userId, oldVideoAssetId);
+
+          logger.info(
+            `[VideoCrawler][${jobId}] Finished downloading video from "${normalizedUrl}" and adding it to the database`,
+          );
+        } catch (error) {
+          if (error instanceof StorageQuotaError) {
+            logger.warn(
+              `[VideoCrawler][${jobId}] Skipping video storage due to quota exceeded: ${error.message}`,
+            );
+            await deleteLeftOverAssetFile(jobId, videoAssetId);
+            // Don't return — continue to transcript extraction
+          } else {
+            throw error;
+          }
+        }
+      }
+    } catch (e) {
+      await deleteLeftOverAssetFile(jobId, videoAssetId);
+      job.abortSignal.throwIfAborted();
+
+      const err = e as Error;
+      if (
+        err.message.includes("ERROR: Unsupported URL:") ||
+        err.message.includes("No media found")
+      ) {
+        logger.info(
+          `[VideoCrawler][${jobId}] Skipping video download from "${normalizedUrl}", because it's not one of the supported yt-dlp URLs`,
+        );
+        return; // Truly unsupported URL — transcript won't work either
+      }
+      const genericError = `[VideoCrawler][${jobId}] Failed to download a file from "${normalizedUrl}" to "${assetPath}"`;
+      if ("stderr" in err) {
+        logger.error(`${genericError}: ${err.stderr}`);
+      } else {
+        logger.error(genericError);
+      }
+      // Don't return for generic download errors — try transcript next
     }
-    assetPath = downloadPath;
-  } catch (e) {
-    const err = e as Error;
-    if (
-      err.message.includes("ERROR: Unsupported URL:") ||
-      err.message.includes("No media found")
-    ) {
-      logger.info(
-        `[VideoCrawler][${jobId}] Skipping video download from "${normalizedUrl}", because it's not one of the supported yt-dlp URLs`,
-      );
-      return;
-    }
-    const genericError = `[VideoCrawler][${jobId}] Failed to download a file from "${normalizedUrl}" to "${assetPath}"`;
-    if ("stderr" in err) {
-      logger.error(`${genericError}: ${err.stderr}`);
-    } else {
-      logger.error(genericError);
-    }
-    await deleteLeftOverAssetFile(jobId, videoAssetId);
-    return;
+  } else {
+    logger.info(
+      `[VideoCrawler][${jobId}] Skipping video download from "${normalizedUrl}", because it is disabled in the config.`,
+    );
   }
 
-  logger.info(
-    `[VideoCrawler][${jobId}] Finished downloading a file from "${normalizedUrl}" to "${assetPath}"`,
-  );
-
-  // Get file size and check quota before saving
-  const stats = await fs.promises.stat(assetPath);
-  const fileSize = stats.size;
+  // Transcript extraction — runs REGARDLESS of video download setting
+  const transcriptTmpDir = `${TMP_FOLDER}/transcript_${jobId}`;
+  await fs.promises.mkdir(transcriptTmpDir, { recursive: true });
 
   try {
-    const quotaApproved = await QuotaService.checkStorageQuota(
-      db,
-      userId,
-      fileSize,
+    const transcript = await extractTranscript(
+      normalizedUrl,
+      transcriptTmpDir,
+      jobId,
+      job.abortSignal,
     );
 
-    await saveAssetFromFile({
-      userId,
-      assetId: videoAssetId,
-      assetPath,
-      metadata: { contentType: ASSET_TYPES.VIDEO_MP4 },
-      quotaApproved,
-    });
-
-    await db.transaction(async (txn) => {
-      await updateAsset(
-        oldVideoAssetId,
-        {
-          id: videoAssetId,
-          bookmarkId,
-          userId,
-          assetType: AssetTypes.LINK_VIDEO,
-          contentType: ASSET_TYPES.VIDEO_MP4,
-          size: fileSize,
-        },
-        txn,
+    if (transcript) {
+      await storeTranscriptContent(
+        bookmarkId,
+        userId,
+        transcript,
+        jobId,
+        normalizedUrl,
       );
-    });
-    await silentDeleteAsset(userId, oldVideoAssetId);
-
-    logger.info(
-      `[VideoCrawler][${jobId}] Finished downloading video from "${normalizedUrl}" and adding it to the database`,
-    );
-  } catch (error) {
-    if (error instanceof StorageQuotaError) {
-      logger.warn(
-        `[VideoCrawler][${jobId}] Skipping video storage due to quota exceeded: ${error.message}`,
-      );
-      await deleteLeftOverAssetFile(jobId, videoAssetId);
-      return;
     }
-    throw error;
+  } finally {
+    await fs.promises
+      .rm(transcriptTmpDir, { recursive: true, force: true })
+      .catch(() => {
+        // Ignore cleanup errors
+      });
+  }
+
+  // Fire webhook after all processing completes (not in finally — we don't
+  // want to emit for validation failures or unsupported URLs)
+  if (!job.abortSignal.aborted) {
+    const webhookService = new WebhooksService(db);
+    await webhookService.triggerWebhook(bookmarkId, "video_processed", userId, {
+      groupId: userId,
+    });
   }
 }
 

@@ -34,7 +34,11 @@ import { withWorkerTracing } from "workerTracing";
 import { getBookmarkDetails, updateAsset } from "workerUtils";
 import { z } from "zod";
 
-import type { ZCrawlLinkRequest } from "@karakeep/shared-server";
+import type {
+  StoreHtmlResult,
+  ZCrawlLinkRequest,
+} from "@karakeep/shared-server";
+import { storeHtmlContent as storeHtmlContentBase } from "@karakeep/shared-server";
 import { db } from "@karakeep/db";
 import {
   assets,
@@ -1609,12 +1613,7 @@ async function handleAsAssetBookmark(
   );
 }
 
-type StoreHtmlResult =
-  | { result: "stored"; assetId: string; size: number }
-  | { result: "store_inline" }
-  | { result: "not_stored" };
-
-async function storeHtmlContent(
+async function storeHtmlContentWithTracing(
   htmlContent: string | undefined,
   userId: string,
   jobId: string,
@@ -1632,60 +1631,17 @@ async function storeHtmlContent(
       },
     },
     async () => {
-      if (!htmlContent) {
-        return { result: "not_stored" };
-      }
-
-      const contentSize = Buffer.byteLength(htmlContent, "utf8");
-
-      // Only store in assets if content is >= 50KB
-      if (contentSize < serverConfig.crawler.htmlContentSizeThreshold) {
+      const result = await storeHtmlContentBase(htmlContent, userId);
+      if (result.result === "store_inline") {
+        logger.info(`[Crawler][${jobId}] HTML content storing inline`);
+      } else if (result.result === "stored") {
         logger.info(
-          `[Crawler][${jobId}] HTML content size (${contentSize} bytes) is below threshold, storing inline`,
+          `[Crawler][${jobId}] Stored large HTML content (${result.size} bytes) as asset: ${result.assetId}`,
         );
-        return { result: "store_inline" };
+      } else {
+        logger.info(`[Crawler][${jobId}] HTML content not stored`);
       }
-
-      const { data: quotaApproved, error: quotaError } = await tryCatch(
-        QuotaService.checkStorageQuota(db, userId, contentSize),
-      );
-      if (quotaError) {
-        logger.warn(
-          `[Crawler][${jobId}] Skipping HTML content storage due to quota exceeded: ${quotaError.message}`,
-        );
-        return { result: "not_stored" };
-      }
-
-      const assetId = newAssetId();
-
-      const { error: saveError } = await tryCatch(
-        saveAsset({
-          userId,
-          assetId,
-          asset: Buffer.from(htmlContent, "utf8"),
-          metadata: {
-            contentType: ASSET_TYPES.TEXT_HTML,
-            fileName: null,
-          },
-          quotaApproved,
-        }),
-      );
-      if (saveError) {
-        logger.error(
-          `[Crawler][${jobId}] Failed to store HTML content as asset: ${saveError}`,
-        );
-        throw saveError;
-      }
-
-      logger.info(
-        `[Crawler][${jobId}] Stored large HTML content (${contentSize} bytes) as asset: ${assetId}`,
-      );
-
-      return {
-        result: "stored",
-        assetId,
-        size: contentSize,
-      };
+      return result;
     },
   );
 }
@@ -1831,11 +1787,29 @@ async function crawlAndParseUrl(
       ]);
       abortSignal.throwIfAborted();
 
-      const htmlContentAssetInfo = await storeHtmlContent(
-        readableContent?.content,
-        userId,
-        jobId,
-      );
+      // Check if content should be protected from recrawl
+      const existingLink = await db.query.bookmarkLinks.findFirst({
+        where: eq(bookmarkLinks.id, bookmarkId),
+        columns: { contentSource: true },
+      });
+
+      const skipContentWrite =
+        existingLink?.contentSource === "manual" ||
+        existingLink?.contentSource === "transcript";
+
+      if (skipContentWrite) {
+        logger.info(
+          `[Crawler][${jobId}] Skipping content write: contentSource is ${existingLink?.contentSource}`,
+        );
+      }
+
+      const htmlContentAssetInfo: StoreHtmlResult = skipContentWrite
+        ? { result: "not_stored" }
+        : await storeHtmlContentWithTracing(
+            readableContent?.content,
+            userId,
+            jobId,
+          );
       abortSignal.throwIfAborted();
       let imageAssetInfo: DBAssetType | null = null;
       if (meta.image) {
@@ -1861,22 +1835,34 @@ async function crawlAndParseUrl(
       // Phase 2: Write content and asset references.
       // TODO(important): Restrict the size of content to store
       const assetDeletionTasks: Promise<void>[] = [];
+      // Only replace content when we actually have new content (stored or inline).
+      // When not_stored (quota exceeded / no parsed content), preserve existing content.
+      const shouldReplaceContent =
+        !skipContentWrite &&
+        (htmlContentAssetInfo.result === "store_inline" ||
+          htmlContentAssetInfo.result === "stored");
       const inlineHtmlContent =
         htmlContentAssetInfo.result === "store_inline"
           ? (readableContent?.content ?? null)
           : null;
       readableContent = null;
       await db.transaction(async (txn) => {
+        const linkUpdate: Partial<typeof bookmarkLinks.$inferInsert> = {
+          crawledAt: new Date(),
+        };
+
+        if (shouldReplaceContent) {
+          linkUpdate.htmlContent = inlineHtmlContent;
+          linkUpdate.contentAssetId =
+            htmlContentAssetInfo.result === "stored"
+              ? htmlContentAssetInfo.assetId
+              : null;
+          linkUpdate.contentSource = "crawled";
+        }
+
         await txn
           .update(bookmarkLinks)
-          .set({
-            crawledAt: new Date(),
-            htmlContent: inlineHtmlContent,
-            contentAssetId:
-              htmlContentAssetInfo.result === "stored"
-                ? htmlContentAssetInfo.assetId
-                : null,
-          })
+          .set(linkUpdate)
           .where(eq(bookmarkLinks.id, bookmarkId));
 
         if (screenshotAssetInfo) {
@@ -1932,8 +1918,8 @@ async function crawlAndParseUrl(
             txn,
           );
           assetDeletionTasks.push(silentDeleteAsset(userId, oldContentAssetId));
-        } else if (oldContentAssetId) {
-          // Unlink the old content asset
+        } else if (oldContentAssetId && shouldReplaceContent) {
+          // Unlink the old content asset (only when we're actually replacing content)
           await txn.delete(assets).where(eq(assets.id, oldContentAssetId));
           assetDeletionTasks.push(silentDeleteAsset(userId, oldContentAssetId));
         }
@@ -2149,8 +2135,11 @@ async function runCrawler(
     // Update the search index
     await triggerSearchReindex(bookmarkId, enqueueOpts);
 
-    if (serverConfig.crawler.downloadVideo) {
-      // Trigger a potential download of a video from the URL
+    if (
+      serverConfig.crawler.downloadVideo ||
+      serverConfig.crawler.extractTranscript
+    ) {
+      // Trigger video download and/or transcript extraction
       await VideoWorkerQueue.enqueue(
         {
           bookmarkId,

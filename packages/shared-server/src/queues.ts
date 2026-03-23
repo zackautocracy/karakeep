@@ -243,7 +243,14 @@ export const AssetPreprocessingQueue =
 // Webhook worker
 export const zWebhookRequestSchema = z.object({
   bookmarkId: z.string(),
-  operation: z.enum(["crawled", "created", "edited", "ai tagged", "deleted"]),
+  operation: z.enum([
+    "crawled",
+    "created",
+    "edited",
+    "ai tagged",
+    "deleted",
+    "video_processed",
+  ]),
   userId: z.string().optional(),
 });
 export type ZWebhookRequest = z.infer<typeof zWebhookRequestSchema>;
