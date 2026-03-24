@@ -31,6 +31,7 @@ vi.mock("@karakeep/shared-server", async (original) => {
       enqueue: vi.fn(),
     },
     triggerSearchReindex: vi.fn(),
+    storeHtmlContent: vi.fn().mockResolvedValue({ result: "store_inline" }),
   };
 });
 
@@ -1469,5 +1470,135 @@ describe("Bookmark Routes", () => {
       });
       expect(result.bookmarkId).toBeNull();
     });
+  });
+
+  test<CustomTestContext>("update bookmark htmlContent sets contentSource to manual", async ({
+    apiCallers,
+    db,
+  }) => {
+    const api = apiCallers[0].bookmarks;
+    const bookmark = await api.createBookmark({
+      url: "https://example.com",
+      type: BookmarkTypes.LINK,
+    });
+
+    await api.updateBookmark({
+      bookmarkId: bookmark.id,
+      htmlContent: "<p>Custom content</p>",
+    });
+
+    const link = await db.query.bookmarkLinks.findFirst({
+      where: eq(bookmarkLinks.id, bookmark.id),
+    });
+    expect(link?.contentSource).toEqual("manual");
+    expect(link?.htmlContent).toEqual("<p>Custom content</p>");
+  });
+
+  test<CustomTestContext>("update bookmark htmlContent null resets contentSource", async ({
+    apiCallers,
+    db,
+  }) => {
+    const api = apiCallers[0].bookmarks;
+    const bookmark = await api.createBookmark({
+      url: "https://example.com",
+      type: BookmarkTypes.LINK,
+    });
+
+    // First set manual content
+    await api.updateBookmark({
+      bookmarkId: bookmark.id,
+      htmlContent: "<p>Custom content</p>",
+    });
+
+    // Then clear it
+    await api.updateBookmark({
+      bookmarkId: bookmark.id,
+      htmlContent: null,
+    });
+
+    const link = await db.query.bookmarkLinks.findFirst({
+      where: eq(bookmarkLinks.id, bookmark.id),
+    });
+    expect(link?.contentSource).toEqual("crawled");
+    expect(link?.htmlContent).toBeNull();
+    expect(link?.contentAssetId).toBeNull();
+  });
+
+  test<CustomTestContext>("update bookmark htmlContent sanitizes XSS", async ({
+    apiCallers,
+    db,
+  }) => {
+    const api = apiCallers[0].bookmarks;
+    const bookmark = await api.createBookmark({
+      url: "https://example.com",
+      type: BookmarkTypes.LINK,
+    });
+
+    await api.updateBookmark({
+      bookmarkId: bookmark.id,
+      htmlContent:
+        '<p>Hello</p><script>alert("xss")</script><img onerror="alert(1)" src="x">',
+    });
+
+    const link = await db.query.bookmarkLinks.findFirst({
+      where: eq(bookmarkLinks.id, bookmark.id),
+    });
+    expect(link?.contentSource).toEqual("manual");
+    expect(link?.htmlContent).not.toContain("<script>");
+    expect(link?.htmlContent).not.toContain("onerror");
+    expect(link?.htmlContent).toContain("<p>Hello</p>");
+  });
+
+  test<CustomTestContext>("update bookmark htmlContent on text bookmark throws", async ({
+    apiCallers,
+  }) => {
+    const api = apiCallers[0].bookmarks;
+    const bookmark = await api.createBookmark({
+      text: "Some text",
+      type: BookmarkTypes.TEXT,
+    });
+
+    await expect(
+      api.updateBookmark({
+        bookmarkId: bookmark.id,
+        htmlContent: "<p>Content</p>",
+      }),
+    ).rejects.toThrow(/non-link type bookmark/);
+  });
+
+  test<CustomTestContext>("update bookmark htmlContent with triggerInference persists content", async ({
+    apiCallers,
+    db,
+  }) => {
+    const api = apiCallers[0].bookmarks;
+    const bookmark = await api.createBookmark({
+      url: "https://example.com",
+      type: BookmarkTypes.LINK,
+    });
+
+    // triggerInference: true should not throw and should succeed
+    await api.updateBookmark({
+      bookmarkId: bookmark.id,
+      htmlContent: "<p>Content for AI</p>",
+      triggerInference: true,
+    });
+
+    // Verify content was set (proves the htmlContent path works)
+    const link = await db.query.bookmarkLinks.findFirst({
+      where: eq(bookmarkLinks.id, bookmark.id),
+    });
+    expect(link?.contentSource).toEqual("manual");
+    expect(link?.htmlContent).toContain("Content for AI");
+
+    // triggerInference: false should also succeed
+    await api.updateBookmark({
+      bookmarkId: bookmark.id,
+      htmlContent: "<p>Updated content</p>",
+      triggerInference: false,
+    });
+    const updatedLink = await db.query.bookmarkLinks.findFirst({
+      where: eq(bookmarkLinks.id, bookmark.id),
+    });
+    expect(updatedLink?.htmlContent).toContain("Updated content");
   });
 });

@@ -52,6 +52,7 @@ export const zBookmarkedLinkSchema = z.object({
   favicon: z.string().nullish(),
   htmlContent: z.string().nullish(),
   contentAssetId: z.string().nullish(),
+  contentSource: z.enum(["crawled", "manual", "transcript"]).nullish(),
   crawledAt: z.date().nullish(),
   crawlStatus: z.enum(["success", "failure", "pending"]).nullish(),
   author: z.string().nullish(),
@@ -242,6 +243,10 @@ export const zUpdateBookmarksRequestSchema = z.object({
 
   // Asset specific fields (optional)
   assetContent: z.string().nullish(),
+
+  // Link HTML content (optional) — for setting reader view content via API
+  htmlContent: z.string().nullish(),
+  triggerInference: z.boolean().optional(),
 });
 export type ZUpdateBookmarksRequest = z.infer<
   typeof zUpdateBookmarksRequestSchema

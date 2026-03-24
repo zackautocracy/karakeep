@@ -243,6 +243,15 @@
                     "type": "string",
                     "nullable": true
                   },
+                  "contentSource": {
+                    "type": "string",
+                    "nullable": true,
+                    "enum": [
+                      "crawled",
+                      "manual",
+                      "transcript"
+                    ]
+                  },
                   "crawledAt": {
                     "type": "string",
                     "nullable": true
@@ -1331,6 +1340,13 @@
                   "assetContent": {
                     "type": "string",
                     "nullable": true
+                  },
+                  "htmlContent": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "triggerInference": {
+                    "type": "boolean"
                   }
                 }
               }
